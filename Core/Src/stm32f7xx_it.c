@@ -22,6 +22,8 @@
 #include "stm32f7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,7 +43,201 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+extern UART_HandleTypeDef huart3;
 
+/* --------------------------------------------------------------------------
+ * HardFault diagnostic support
+ * -------------------------------------------------------------------------- */
+
+static void fault_puts(const char *s)
+{
+    HAL_UART_Transmit(&huart3,
+                      (uint8_t *)s,
+                      (uint16_t)strlen(s),
+                      1000);
+}
+
+static void fault_print_hex(uint32_t v)
+{
+    char buf[11];
+    snprintf(buf, sizeof(buf), "0x%08lX",
+             (unsigned long)v);
+    fault_puts(buf);
+}
+
+static void fault_print_dec(uint32_t v)
+{
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu",
+             (unsigned long)v);
+    fault_puts(buf);
+}
+
+static void fault_report(uint32_t *stack_frame,
+                         uint32_t *r4_r11,
+                         uint32_t exc_return)
+{
+    fault_puts("\r\n\r\n");
+    fault_puts("========== HARDFAULT ==========\r\n");
+
+    fault_puts("EXC_RETURN = ");
+    fault_print_hex(exc_return);
+    fault_puts("\r\n");
+
+    fault_puts("Stack frame = ");
+    fault_print_hex((uint32_t)stack_frame);
+    fault_puts("\r\n");
+
+    fault_puts("\r\n[Exception Stack Frame]\r\n");
+
+    fault_puts("R0   = ");
+    fault_print_hex(stack_frame[0]);
+    fault_puts("\r\n");
+
+    fault_puts("R1   = ");
+    fault_print_hex(stack_frame[1]);
+    fault_puts("\r\n");
+
+    fault_puts("R2   = ");
+    fault_print_hex(stack_frame[2]);
+    fault_puts("\r\n");
+
+    fault_puts("R3   = ");
+    fault_print_hex(stack_frame[3]);
+    fault_puts("\r\n");
+
+    fault_puts("R12  = ");
+    fault_print_hex(stack_frame[4]);
+    fault_puts("\r\n");
+
+    fault_puts("LR   = ");
+    fault_print_hex(stack_frame[5]);
+    fault_puts("\r\n");
+
+    fault_puts("PC   = ");
+    fault_print_hex(stack_frame[6]);
+    fault_puts("\r\n");
+
+    fault_puts("xPSR = ");
+    fault_print_hex(stack_frame[7]);
+    fault_puts("\r\n");
+
+    fault_puts("\r\n[Saved R4-R11]\r\n");
+
+    fault_puts("R4   = ");
+    fault_print_hex(r4_r11[0]);
+    fault_puts("\r\n");
+
+    fault_puts("R5   = ");
+    fault_print_hex(r4_r11[1]);
+    fault_puts("\r\n");
+
+    fault_puts("R6   = ");
+    fault_print_hex(r4_r11[2]);
+    fault_puts("\r\n");
+
+    fault_puts("R7   = ");
+    fault_print_hex(r4_r11[3]);
+    fault_puts("\r\n");
+
+    fault_puts("R8   = ");
+    fault_print_hex(r4_r11[4]);
+    fault_puts("\r\n");
+
+    fault_puts("R9   = ");
+    fault_print_hex(r4_r11[5]);
+    fault_puts("\r\n");
+
+    fault_puts("R10  = ");
+    fault_print_hex(r4_r11[6]);
+    fault_puts("\r\n");
+
+    fault_puts("R11  = ");
+    fault_print_hex(r4_r11[7]);
+    fault_puts("\r\n");
+
+    fault_puts("\r\n[Stack dump]\r\n");
+
+    for (uint32_t i = 0; i < 16; i++)
+    {
+        if ((i % 4) == 0)
+        {
+            fault_puts("SP+");
+            fault_print_hex(i * 4);
+            fault_puts(": ");
+        }
+
+        fault_print_hex(stack_frame[i]);
+        fault_puts(" ");
+
+        if ((i % 4) == 3)
+            fault_puts("\r\n");
+    }
+
+    fault_puts("\r\n[Fault status]\r\n");
+
+    fault_puts("CFSR = ");
+    fault_print_hex(SCB->CFSR);
+    fault_puts("\r\n");
+
+    fault_puts("HFSR = ");
+    fault_print_hex(SCB->HFSR);
+    fault_puts("\r\n");
+
+    fault_puts("DFSR = ");
+    fault_print_hex(SCB->DFSR);
+    fault_puts("\r\n");
+
+    fault_puts("AFSR = ");
+    fault_print_hex(SCB->AFSR);
+    fault_puts("\r\n");
+
+    fault_puts("MMFAR = ");
+    fault_print_hex(SCB->MMFAR);
+    fault_puts("\r\n");
+
+    fault_puts("BFAR = ");
+    fault_print_hex(SCB->BFAR);
+    fault_puts("\r\n");
+
+    fault_puts("\r\n================================\r\n");
+    fault_puts("FAULT HALTED\r\n");
+
+    while (1)
+    {
+        __NOP();
+    }
+}
+
+__attribute__((naked))
+static void fault_handler_asm(void)
+{
+    __asm volatile
+    (
+        "tst     lr, #4                  \n"
+        "ite     eq                      \n"
+        "mrseq   r0, msp                 \n"
+        "mrsne   r0, psp                 \n"
+
+        "push    {r4-r11}                \n"
+
+        "mov     r1, sp                  \n"
+
+        "mov     r2, lr                  \n"
+
+        "b       fault_handler_c         \n"
+    );
+}
+
+static void fault_handler_c(uint32_t *stack_frame,
+                            uint32_t *r4_r11,
+                            uint32_t exc_return) __attribute__((used));
+static void fault_handler_c(uint32_t *stack_frame,
+                            uint32_t *r4_r11,
+                            uint32_t exc_return)
+{
+    fault_report(stack_frame, r4_r11, exc_return);
+}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,13 +280,13 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
+  fault_handler_asm();
 
-  /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
+    __NOP();
   }
+  /* USER CODE END HardFault_IRQn 0 */
 }
 
 /**

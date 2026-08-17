@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -73,6 +74,7 @@ typedef struct __attribute__((packed)) {
 /* Private variables ---------------------------------------------------------*/
 
 UART_HandleTypeDef huart3;
+CRC_HandleTypeDef hcrc;
 
 /* USER CODE BEGIN PV */
 
@@ -83,6 +85,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_CRC_Init(void);
 /* USER CODE BEGIN PFP */
 static const HTTPSsettings* get_latest_settings(void);
 static void log_msg(const char *msg);
@@ -174,14 +177,29 @@ static void jump_to_app(uint32_t app_addr)
 
 static uint32_t calculate_crc(const HTTPSsettings *settings)
 {
-  uint32_t crc = 0xFFFFFFFF;
-  const uint8_t *data = (const uint8_t *)settings;
-  for (size_t i = 0; i < sizeof(HTTPSsettings); i++) {
-    crc ^= (uint32_t)data[i] << 24;
-    for (int j = 0; j < 8; j++)
-      crc = (crc & 0x80000000) ? (crc << 1) ^ 0x04C11DB7 : (crc << 1);
-  }
-  return crc;
+    uint32_t word __attribute__((aligned(4)));
+    uint32_t result;
+
+    /* CRC по magic */
+    memcpy(&word, &settings->magic, sizeof(word));
+    result = HAL_CRC_Calculate(&hcrc, &word, 1);
+
+    /*
+     * CRC по данным после поля crc:
+     * domain ... padding.
+     * Само поле settings->crc в расчёт не входит.
+     */
+    const uint8_t *data = (const uint8_t *)&settings->domain;
+    const size_t bytes = sizeof(HTTPSsettings) - offsetof(HTTPSsettings, domain);
+    const size_t words = bytes / sizeof(uint32_t);
+
+    for (size_t i = 0; i < words; i++) {
+        memcpy(&word, data, sizeof(word));
+        result = HAL_CRC_Accumulate(&hcrc, &word, 1);
+        data += sizeof(word);
+    }
+
+    return result;
 }
 
 static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *data)
@@ -199,7 +217,9 @@ static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *
   if (need_erase) {
     FLASH_EraseInitTypeDef erase = {0};
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
-    erase.Sector = FLASH_SECTOR_11;
+    erase.Banks = FLASH_BANK_2;
+    erase.Sector = FLASH_SECTOR_20;
+
     erase.NbSectors = 1;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
     uint32_t err = 0;
@@ -281,10 +301,24 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_USART3_UART_Init();
-  /* USER CODE BEGIN 2 */
+	MX_GPIO_Init();
+	MX_USART3_UART_Init();
+	MX_CRC_Init();
+	/* USER CODE BEGIN 2 */
 	log_msg("\r\n[BOOT] === Bootloader started ===\r\n");
+
+	/* ── Проверка режима flash bank ── */
+	{
+		volatile uint32_t optcr = *(volatile uint32_t *)(0x40023C00 + 0x1C);
+		int is_single_bank = (optcr & (1UL << 29)) ? 1 : 0;
+		if (is_single_bank) {
+			log_msg("[BOOT] *** WARNING: Flash is Single Bank! ***\r\n");
+			log_msg("[BOOT] Run: STM32_Programmer_CLI -c port=SWD -ob DBANK=0\r\n");
+			log_msg("[BOOT] OTA will not work until Dual Bank is enabled.\r\n");
+		} else {
+			log_msg("[BOOT] Flash: Dual Bank (OK)\r\n");
+		}
+	}
 
 	const HTTPSsettings *s = get_latest_settings();
 	uint32_t target_addr = BANK_A_ADDR;
@@ -419,6 +453,22 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 2 */
 
+}
+
+static void MX_CRC_Init(void)
+{
+  __HAL_RCC_CRC_CLK_ENABLE();
+
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+
+  if (HAL_CRC_Init(&hcrc) != HAL_OK) {
+    Error_Handler();
+  }
 }
 
 /**
