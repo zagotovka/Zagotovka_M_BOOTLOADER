@@ -52,6 +52,9 @@ default.size.stdout \
 OBJDUMP_LIST += \
 Zagotovka_M_BOOTLOADER.list \
 
+OBJCOPY_BIN += \
+Zagotovka_M_BOOTLOADER.bin \
+
 
 # All Target
 all: main-build
@@ -75,12 +78,17 @@ Zagotovka_M_BOOTLOADER.list: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOO
 	@echo 'Finished building: $@'
 	@echo ' '
 
+Zagotovka_M_BOOTLOADER.bin: $(EXECUTABLES) makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-objcopy  -O binary $(EXECUTABLES) "Zagotovka_M_BOOTLOADER.bin"
+	@echo 'Finished building: $@'
+	@echo ' '
+
 # Other Targets
 clean:
-	-$(RM) Zagotovka_M_BOOTLOADER.elf Zagotovka_M_BOOTLOADER.list Zagotovka_M_BOOTLOADER.map default.size.stdout
+	-$(RM) Zagotovka_M_BOOTLOADER.bin Zagotovka_M_BOOTLOADER.elf Zagotovka_M_BOOTLOADER.list Zagotovka_M_BOOTLOADER.map default.size.stdout
 	-@echo ' '
 
-secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST)
+secondary-outputs: $(SIZE_OUTPUT) $(OBJDUMP_LIST) $(OBJCOPY_BIN)
 
 fail-specified-linker-script-missing:
 	@echo 'Error: Cannot find the specified linker script. Check the linker settings in the build configuration.'

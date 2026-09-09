@@ -73,8 +73,9 @@ typedef struct __attribute__((packed)) {
 
 /* Private variables ---------------------------------------------------------*/
 
-UART_HandleTypeDef huart3;
 CRC_HandleTypeDef hcrc;
+
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 
@@ -92,6 +93,8 @@ static void log_msg(const char *msg);
 static void jump_to_app(uint32_t app_addr);
 static uint32_t calculate_crc(const HTTPSsettings *settings);
 static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *data);
+static bool flash_is_dual_bank(void);
+static bool app_image_valid(uint32_t app_addr);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -106,10 +109,12 @@ static const HTTPSsettings* get_latest_settings(void)
     const HTTPSsettings *valid = 0;
     uint8_t max_ver = 0;
     int found = 0;
+    int magic_cnt = 0;
 
     for (int i = 0; i < SETTINGS_VERSION_COUNT; i++) {
         const HTTPSsettings *s = (const HTTPSsettings *)GET_SETTINGS_ADDR(i);
         if (s->magic != SETTINGS_MAGIC_VALUE) continue;
+        magic_cnt++;
 
         uint32_t calc_crc = calculate_crc(s);
         if (s->crc != calc_crc) {
@@ -125,6 +130,24 @@ static const HTTPSsettings* get_latest_settings(void)
             max_ver = s->version;
             found = 1;
         }
+    }
+
+    /* Диагностика: если ни один слот не прошёл проверку — показать,
+     * что реально лежит во Flash, чтобы отличить "пустой сектор" от
+     * "битого CRC" (несовпадение алгоритма CRC app/bootloader). */
+    if (!found) {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                "[BOOT] WARN: 0 valid slots (%d with magic) out of %d\r\n",
+                magic_cnt, SETTINGS_VERSION_COUNT);
+        log_msg(buf);
+
+        const HTTPSsettings *s0 = (const HTTPSsettings *)GET_SETTINGS_ADDR(0);
+        snprintf(buf, sizeof(buf),
+                "[BOOT] Slot0: magic=0x%08lX crc=0x%08lX calc=0x%08lX ver=%u\r\n",
+                (unsigned long)s0->magic, (unsigned long)s0->crc,
+                (unsigned long)calculate_crc(s0), s0->version);
+        log_msg(buf);
     }
     return valid;
 }
@@ -218,7 +241,14 @@ static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *
     FLASH_EraseInitTypeDef erase = {0};
     erase.TypeErase = FLASH_TYPEERASE_SECTORS;
     erase.Banks = FLASH_BANK_2;
-    erase.Sector = FLASH_SECTOR_20;
+    /*
+     * Сектор с настройками 0x081C0000:
+     *  - dual bank  -> Bank 2, сектор 7 (HAL: FLASH_SECTOR_19)
+     *  - single bank-> сектор 11 (HAL: FLASH_SECTOR_11)
+     * FLASH_SECTOR_20 в dual bank даёт SNB=24 -> "Bank2 сектор 8",
+     * которого не существует — стирание всегда фейлилось.
+     */
+    erase.Sector = flash_is_dual_bank() ? FLASH_SECTOR_19 : FLASH_SECTOR_11;
 
     erase.NbSectors = 1;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
@@ -268,6 +298,27 @@ static bool settings_rollback(const HTTPSsettings *cur)
   return write_settings(cur, &tmp);
 }
 
+/*
+ * Проверка режима банков Flash: бит 29 (nDBANK) регистра OPTCR.
+ * 0 = Dual Bank, 1 = Single Bank. Раньше читался неверный адрес
+ * (0x40023C1C — reserved), из-за чего режим всегда определялся
+ * как "Dual Bank (OK)".
+ */
+static bool flash_is_dual_bank(void)
+{
+  return (FLASH->OPTCR & FLASH_OPTCR_nDBANK) == 0;
+}
+
+/*
+ * Валидность образа приложения по вектору сброса: первый DWORD —
+ * начальный MSP, обязан указывать в SRAM (0x200xxxxx).
+ */
+static bool app_image_valid(uint32_t app_addr)
+{
+  uint32_t msp_val = *(volatile uint32_t *)app_addr;
+  return (msp_val & 0xFFF00000) == 0x20000000;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -301,16 +352,19 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
-	MX_GPIO_Init();
-	MX_USART3_UART_Init();
-	MX_CRC_Init();
-	/* USER CODE BEGIN 2 */
+  MX_GPIO_Init();
+  MX_USART3_UART_Init();
+  MX_CRC_Init();
+  /* USER CODE BEGIN 2 */
+	/* Дать терминалу/монитору порта успеть подключиться,
+	 * иначе первые строки [BOOT] теряются. */
+	HAL_Delay(100);
+
 	log_msg("\r\n[BOOT] === Bootloader started ===\r\n");
 
 	/* ── Проверка режима flash bank ── */
 	{
-		volatile uint32_t optcr = *(volatile uint32_t *)(0x40023C00 + 0x1C);
-		int is_single_bank = (optcr & (1UL << 29)) ? 1 : 0;
+		int is_single_bank = flash_is_dual_bank() ? 0 : 1;
 		if (is_single_bank) {
 			log_msg("[BOOT] *** WARNING: Flash is Single Bank! ***\r\n");
 			log_msg("[BOOT] Run: STM32_Programmer_CLI -c port=SWD -ob DBANK=0\r\n");
@@ -339,24 +393,46 @@ int main(void)
 				log_msg("[BOOT] Committed -> active bank\r\n");
 			} else if (s->ota_state == 2) {
 				log_msg("[BOOT] App requested rollback -> BANK A\r\n");
-				settings_rollback(s);
+				if (!settings_rollback(s)) {
+					log_msg("[BOOT] WARN: rollback write FAILED\r\n");
+				}
 				target_addr = BANK_A_ADDR;
 			} else {
 				uint8_t r = s->ota_boot_retries;
 				if (r >= OTA_BOOT_RETRY_MAX) {
 					log_msg("[BOOT] Max retries -> rollback BANK A\r\n");
-					settings_rollback(s);
+					if (!settings_rollback(s)) {
+						log_msg("[BOOT] WARN: rollback write FAILED\r\n");
+					}
 					target_addr = BANK_A_ADDR;
 				} else {
-					settings_write_retries(s, r + 1);
-					target_addr = BANK_B_ADDR;
-					log_msg("[BOOT] Testing BANK B\r\n");
+					if (!settings_write_retries(s, r + 1)) {
+						/* Не смогли зафиксировать попытку — тест BANK B
+						 * небезопасен (упадём в цикл без счётчика). */
+						log_msg("[BOOT] WARN: retries write FAILED\r\n");
+						target_addr = BANK_A_ADDR;
+					} else {
+						target_addr = BANK_B_ADDR;
+						log_msg("[BOOT] Testing BANK B\r\n");
+					}
 				}
 			}
 		} else {
 			target_addr = (s->ota_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 			log_msg("[BOOT] No OTA -> active bank\r\n");
 		}
+	}
+
+	/* Не прыгать в пустой/битый образ — откат на BANK A
+	 * (иначе бутлоадер зависает навечно в "Bad MSP"). */
+	if (target_addr != BANK_A_ADDR && !app_image_valid(target_addr)) {
+		log_msg("[BOOT] Target bank image INVALID, fallback to BANK A\r\n");
+		if (s != 0 && s->ota_pending == 1) {
+			if (!settings_rollback(s)) {
+				log_msg("[BOOT] WARN: rollback write FAILED\r\n");
+			}
+		}
+		target_addr = BANK_A_ADDR;
 	}
 
 	log_msg(target_addr == BANK_A_ADDR ?
@@ -421,6 +497,37 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief CRC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CRC_Init(void)
+{
+
+  /* USER CODE BEGIN CRC_Init 0 */
+
+  /* USER CODE END CRC_Init 0 */
+
+  /* USER CODE BEGIN CRC_Init 1 */
+
+  /* USER CODE END CRC_Init 1 */
+  hcrc.Instance = CRC;
+  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
+  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
+  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
+  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
+  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
+  if (HAL_CRC_Init(&hcrc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CRC_Init 2 */
+
+  /* USER CODE END CRC_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -453,22 +560,6 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 2 */
 
-}
-
-static void MX_CRC_Init(void)
-{
-  __HAL_RCC_CRC_CLK_ENABLE();
-
-  hcrc.Instance = CRC;
-  hcrc.Init.DefaultPolynomialUse = DEFAULT_POLYNOMIAL_ENABLE;
-  hcrc.Init.DefaultInitValueUse = DEFAULT_INIT_VALUE_ENABLE;
-  hcrc.Init.InputDataInversionMode = CRC_INPUTDATA_INVERSION_NONE;
-  hcrc.Init.OutputDataInversionMode = CRC_OUTPUTDATA_INVERSION_DISABLE;
-  hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_BYTES;
-
-  if (HAL_CRC_Init(&hcrc) != HAL_OK) {
-    Error_Handler();
-  }
 }
 
 /**
