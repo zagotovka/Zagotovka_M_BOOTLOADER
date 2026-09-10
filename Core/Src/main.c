@@ -30,6 +30,18 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+/*
+ * ВНИМАНИЕ (совместимость между поколениями прошивок):
+ * Bank A и Bank B могут содержать РАЗНЫЕ версии прошивки сколько угодно
+ * долго. Обе версии читают/пишут ОДНУ И ТУ ЖЕ структуру HTTPSsettings
+ * в Flash-секторе 11. Если старый код (оставшийся в другом банке или
+ * в непереприошенном bootloader) не знает о новых полях — он трактует
+ * эти байты как соседние/padding и может затереть их при следующей записи.
+ *
+ * Правило: менять эту структуру ТОЛЬКО добавлением полей в конец,
+ * синхронно и байт-в-байт одинаково в Core/Inc/zagotovka.h и
+ * Bootloader/.../main.c. Не переставлять и не менять смысл существующих байт.
+ */
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t crc;
@@ -47,7 +59,9 @@ typedef struct __attribute__((packed)) {
     uint8_t ota_active_bank;
     uint8_t ota_pending;
     uint8_t ota_boot_retries;
-    uint8_t padding[1];
+    uint8_t ota_prev_active_bank;    // банк, активный ДО текущего OTA-цикла
+    char    ota_bank_a_version[16];  // последняя подтверждённая версия в Bank A
+    char    ota_bank_b_version[16];  // последняя подтверждённая версия в Bank B
 } HTTPSsettings;
 /* USER CODE END PTD */
 
@@ -285,13 +299,18 @@ static bool settings_write_retries(const HTTPSsettings *cur, uint8_t new_retries
   return write_settings(cur, &tmp);
 }
 
+/*
+ * Откат: возвращаемся на банк, который был активен ДО текущего OTA-цикла
+ * (ota_prev_active_bank), а не жёстко на Bank A. Активный банк никогда
+ * не трогается, поэтому предыдущий образ всегда остаётся рабочим.
+ */
 static bool settings_rollback(const HTTPSsettings *cur)
 {
   HTTPSsettings tmp;
   memcpy(&tmp, cur, sizeof(HTTPSsettings));
-  tmp.ota_pending = 0;
-  tmp.ota_active_bank = 0;
-  tmp.ota_state = 0;
+  tmp.ota_active_bank  = cur->ota_prev_active_bank;
+  tmp.ota_pending      = 0;
+  tmp.ota_state        = 3;   // он и так уже был committed ранее
   tmp.ota_boot_retries = 0;
   tmp.version = cur->version + 1;
   tmp.crc = calculate_crc(&tmp);
@@ -392,28 +411,33 @@ int main(void)
 				target_addr = (s->ota_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 				log_msg("[BOOT] Committed -> active bank\r\n");
 			} else if (s->ota_state == 2) {
-				log_msg("[BOOT] App requested rollback -> BANK A\r\n");
+				log_msg("[BOOT] App requested rollback\r\n");
 				if (!settings_rollback(s)) {
 					log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 				}
-				target_addr = BANK_A_ADDR;
+				target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 			} else {
 				uint8_t r = s->ota_boot_retries;
 				if (r >= OTA_BOOT_RETRY_MAX) {
-					log_msg("[BOOT] Max retries -> rollback BANK A\r\n");
+					log_msg("[BOOT] Max retries -> rollback to previous bank\r\n");
 					if (!settings_rollback(s)) {
 						log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 					}
-					target_addr = BANK_A_ADDR;
+					target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 				} else {
 					if (!settings_write_retries(s, r + 1)) {
-						/* Не смогли зафиксировать попытку — тест BANK B
-						 * небезопасен (упадём в цикл без счётчика). */
+						/* Не смогли зафиксировать попытку — тест кандидата
+						 * небезопасен (упадём в цикл без счётчика).
+						 * Возвращаемся на банк, откуда пришли. */
 						log_msg("[BOOT] WARN: retries write FAILED\r\n");
-						target_addr = BANK_A_ADDR;
+						target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 					} else {
-						target_addr = BANK_B_ADDR;
-						log_msg("[BOOT] Testing BANK B\r\n");
+						/* Кандидат — банк из ota_active_bank (его выставил
+						 * mg_ota_set_pending_bank: противоположный тому,
+						 * откуда выполнялась прошивка). */
+						target_addr = (s->ota_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
+						log_msg(s->ota_active_bank == 1 ?
+								"[BOOT] Testing BANK B\r\n" : "[BOOT] Testing BANK A\r\n");
 					}
 				}
 			}
@@ -423,16 +447,24 @@ int main(void)
 		}
 	}
 
-	/* Не прыгать в пустой/битый образ — откат на BANK A
-	 * (иначе бутлоадер зависает навечно в "Bad MSP"). */
-	if (target_addr != BANK_A_ADDR && !app_image_valid(target_addr)) {
-		log_msg("[BOOT] Target bank image INVALID, fallback to BANK A\r\n");
+	/* Не прыгать в пустой/битый образ. Оба банка проверяются одинаково
+	 * (без привилегии Bank A): при невалидном цели откатываем настройки
+	 * на предыдущий банк и пробуем противоположный. */
+	if (!app_image_valid(target_addr)) {
+		log_msg("[BOOT] Target bank image INVALID\r\n");
 		if (s != 0 && s->ota_pending == 1) {
 			if (!settings_rollback(s)) {
 				log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 			}
 		}
-		target_addr = BANK_A_ADDR;
+		uint32_t fallback = (target_addr == BANK_A_ADDR) ? BANK_B_ADDR : BANK_A_ADDR;
+		if (app_image_valid(fallback)) {
+			target_addr = fallback;
+			log_msg("[BOOT] Falling back to the other bank\r\n");
+		} else {
+			log_msg("[BOOT] BOTH banks invalid, halting\r\n");
+			while (1);
+		}
 	}
 
 	log_msg(target_addr == BANK_A_ADDR ?
