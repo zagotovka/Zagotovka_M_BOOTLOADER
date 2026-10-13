@@ -35,9 +35,11 @@
  * ВНИМАНИЕ (совместимость между поколениями прошивок):
  * Bank A и Bank B могут содержать РАЗНЫЕ версии прошивки сколько угодно
  * долго. Обе версии читают/пишут ОДНУ И ТУ ЖЕ структуру HTTPSsettings
- * в Flash-секторе 11. Если старый код (оставшийся в другом банке или
- * в непереприошенном bootloader) не знает о новых полях — он трактует
- * эти байты как соседние/padding и может затереть их при следующей записи.
+ * в области настроек по адресу 0x081C0000 (256 КБ: сектор 11 в
+ * однобанковом режиме, секторы 22 + 23 в двухбанковом режиме).
+ * Если старый код (оставшийся в другом банке или в непереприошенном
+ * bootloader) не знает о новых полях — он трактует эти байты как
+ * соседние/padding и может затереть их при следующей записи.
  *
  * Правило: менять эту структуру ТОЛЬКО добавлением полей в конец,
  * синхронно и байт-в-байт одинаково в Core/Inc/zagotovka.h и
@@ -75,6 +77,15 @@ typedef struct __attribute__((packed)) {
 #define SETTINGS_ALIGNED_SIZE ((sizeof(HTTPSsettings) + 3) / 4 * 4)
 #define GET_SETTINGS_ADDR(index) (FLASH_SECTOR_11_START_ADDR + (index) * SETTINGS_ALIGNED_SIZE)
 
+/* Общий размер области настроек во Flash: 256 КБ.
+ *  - Single Bank: один сектор 11 (256 КБ).
+ *  - Dual Bank  : два сектора по 128 КБ: 22 (0x081C0000) и 23 (0x081E0000). */
+#define SETTINGS_AREA_SIZE (256u * 1024u)
+
+/* Все 94 слота обязаны помещаться в область настроек. */
+typedef char static_assertion_settings_slots_fit_area[
+    ((SETTINGS_VERSION_COUNT * ((sizeof(HTTPSsettings) + 3) / 4 * 4)) <= SETTINGS_AREA_SIZE) ? 1 : -1];
+
 #define BANK_A_ADDR 0x08040000
 #define BANK_B_ADDR 0x08100000
 
@@ -92,7 +103,11 @@ CRC_HandleTypeDef hcrc;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-
+/* Адрес текущего (последнего валидного) слота настроек во Flash.
+ * 0 — валидных настроек нет. Обновляется после каждой успешной записи,
+ * поэтому не зависит от того, что после стирания сектора старый слот
+ * во Flash уже недоступен. */
+static uint32_t s_slot_addr = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -106,7 +121,8 @@ static const HTTPSsettings* get_latest_settings(void);
 static void log_msg(const char *msg);
 static void jump_to_app(uint32_t app_addr);
 static uint32_t calculate_crc(const HTTPSsettings *settings);
-static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *data);
+static bool write_settings(const HTTPSsettings *data);
+static bool settings_area_is_erased(void);
 static bool flash_is_dual_bank(void);
 static bool app_image_valid(uint32_t app_addr);
 /* USER CODE END PFP */
@@ -239,36 +255,69 @@ static uint32_t calculate_crc(const HTTPSsettings *settings)
     return result;
 }
 
-static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *data)
+/*
+ * Проверка, что вся область слотов настроек стёрта (все слова == 0xFFFFFFFF).
+ * Нужна после стирания: HAL_FLASHEx_Erase() может вернуть HAL_OK и при
+ * неверно выбранном секторе, а запись поверх нестёртых данных даёт слот
+ * с верным magic и битым CRC.
+ */
+static bool settings_area_is_erased(void)
+{
+    const volatile uint32_t *p = (const volatile uint32_t *)FLASH_SECTOR_11_START_ADDR;
+    const size_t words = (SETTINGS_VERSION_COUNT * SETTINGS_ALIGNED_SIZE) / 4;
+    for (size_t i = 0; i < words; i++) {
+        if (p[i] != 0xFFFFFFFFu) return false;
+    }
+    return true;
+}
+
+/*
+ * Запись новой копии настроек в следующий слот (по кругу, 94 слота).
+ * Когда круг замыкается (следующий индекс 0), стирается ВСЯ область
+ * настроек и запись идёт в слот 0.
+ *
+ * Область настроек 0x081C0000 .. 0x081FFFFF (256 КБ):
+ *  - Single Bank: сектор 11 (FLASH_SECTOR_11), 256 КБ;
+ *  - Dual Bank  : Bank 2, секторы 22 и 23 (FLASH_SECTOR_22, FLASH_SECTOR_23),
+ *                 по 128 КБ каждый — стирать нужно ОБА.
+ * Сектора 19 и 20 (0x08160000 .. 0x0819FFFF) в Dual Bank относятся к образу
+ * Bank B — стирать их нельзя.
+ */
+static bool write_settings(const HTTPSsettings *data)
 {
   int cur_idx = -1;
-  if (cur_flash) {
-    cur_idx = ((uint32_t)cur_flash - FLASH_SECTOR_11_START_ADDR) / SETTINGS_ALIGNED_SIZE;
+  if (s_slot_addr != 0) {
+    cur_idx = (int)((s_slot_addr - FLASH_SECTOR_11_START_ADDR) / SETTINGS_ALIGNED_SIZE);
   }
   int next_idx = (cur_idx + 1) % SETTINGS_VERSION_COUNT;
   uint32_t next_addr = GET_SETTINGS_ADDR(next_idx);
   bool need_erase = (next_idx == 0) || (next_idx < cur_idx);
 
-  if (HAL_FLASH_Unlock() != HAL_OK) return false;
+  if (HAL_FLASH_Unlock() != HAL_OK) {
+    log_msg("[BOOT] settings: flash unlock FAILED\r\n");
+    return false;
+  }
 
   if (need_erase) {
     FLASH_EraseInitTypeDef erase = {0};
-    erase.TypeErase = FLASH_TYPEERASE_SECTORS;
-    erase.Banks = FLASH_BANK_2;
-    /*
-     * Сектор с настройками 0x081C0000:
-     *  - dual bank  -> Bank 2, сектор 7 (HAL: FLASH_SECTOR_19)
-     *  - single bank-> сектор 11 (HAL: FLASH_SECTOR_11)
-     * FLASH_SECTOR_20 в dual bank даёт SNB=24 -> "Bank2 сектор 8",
-     * которого не существует — стирание всегда фейлилось.
-     */
-    erase.Sector = flash_is_dual_bank() ? FLASH_SECTOR_19 : FLASH_SECTOR_11;
-
-    erase.NbSectors = 1;
+    erase.TypeErase    = FLASH_TYPEERASE_SECTORS;
     erase.VoltageRange = FLASH_VOLTAGE_RANGE_3;
+    if (flash_is_dual_bank()) {
+      erase.Sector    = FLASH_SECTOR_22;   /* 0x081C0000, 128 КБ */
+      erase.NbSectors = 2;                 /* + FLASH_SECTOR_23, 0x081E0000 */
+    } else {
+      erase.Sector    = FLASH_SECTOR_11;   /* 0x081C0000, 256 КБ */
+      erase.NbSectors = 1;
+    }
     uint32_t err = 0;
     if (HAL_FLASHEx_Erase(&erase, &err) != HAL_OK) {
       HAL_FLASH_Lock();
+      log_msg("[BOOT] settings: erase FAILED\r\n");
+      return false;
+    }
+    if (!settings_area_is_erased()) {
+      HAL_FLASH_Lock();
+      log_msg("[BOOT] settings: area NOT erased after erase, abort\r\n");
       return false;
     }
     next_addr = FLASH_SECTOR_11_START_ADDR;
@@ -281,22 +330,38 @@ static bool write_settings(const HTTPSsettings *cur_flash, const HTTPSsettings *
     memcpy(&word, src + i * 4, sizeof(uint32_t));
     if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, (uint32_t)(dst + i), word) != HAL_OK) {
       HAL_FLASH_Lock();
+      log_msg("[BOOT] settings: program FAILED\r\n");
       return false;
     }
   }
 
   HAL_FLASH_Lock();
+
+  /* Проверка записи: содержимое слота должно совпасть с записанным. */
+  if (memcmp((const void *)next_addr, data, sizeof(HTTPSsettings)) != 0) {
+    log_msg("[BOOT] settings: verify FAILED\r\n");
+    return false;
+  }
+
+  s_slot_addr = next_addr;
   return true;
 }
 
-static bool settings_write_retries(const HTTPSsettings *cur, uint8_t new_retries)
+/*
+ * cur — рабочая КОПИЯ настроек в RAM (не указатель на Flash). После успешной
+ * записи копия обновляется, поэтому она всегда соответствует последнему
+ * слоту, даже если запись потребовала стирания области.
+ */
+static bool settings_write_retries(HTTPSsettings *cur, uint8_t new_retries)
 {
   HTTPSsettings tmp;
   memcpy(&tmp, cur, sizeof(HTTPSsettings));
   tmp.ota_boot_retries = new_retries;
   tmp.version = cur->version + 1;
   tmp.crc = calculate_crc(&tmp);
-  return write_settings(cur, &tmp);
+  if (!write_settings(&tmp)) return false;
+  memcpy(cur, &tmp, sizeof(HTTPSsettings));
+  return true;
 }
 
 /*
@@ -309,7 +374,7 @@ static bool settings_write_retries(const HTTPSsettings *cur, uint8_t new_retries
  *                                 не смог доказать свою надёжность
  *                                 (исчерпан лимит пробных загрузок).
  */
-static bool settings_rollback(const HTTPSsettings *cur, uint8_t new_state)
+static bool settings_rollback(HTTPSsettings *cur, uint8_t new_state)
 {
   HTTPSsettings tmp;
   memcpy(&tmp, cur, sizeof(HTTPSsettings));
@@ -319,7 +384,9 @@ static bool settings_rollback(const HTTPSsettings *cur, uint8_t new_state)
   tmp.ota_boot_retries = 0;
   tmp.version = cur->version + 1;
   tmp.crc = calculate_crc(&tmp);
-  return write_settings(cur, &tmp);
+  if (!write_settings(&tmp)) return false;
+  memcpy(cur, &tmp, sizeof(HTTPSsettings));
+  return true;
 }
 
 /*
@@ -398,7 +465,19 @@ int main(void)
 		}
 	}
 
-	const HTTPSsettings *s = get_latest_settings();
+	/* Рабочая копия настроек в RAM: после любой записи во Flash
+	 * (а она может стереть область настроек) указатель на старый слот
+	 * использовать нельзя, поэтому все решения принимаются по копии. */
+	HTTPSsettings s_copy;
+	const HTTPSsettings *s = 0;
+	{
+		const HTTPSsettings *s_flash = get_latest_settings();
+		if (s_flash != 0) {
+			memcpy(&s_copy, s_flash, sizeof(HTTPSsettings));
+			s_slot_addr = (uint32_t)s_flash;
+			s = &s_copy;
+		}
+	}
 	uint32_t target_addr = BANK_A_ADDR;
 
 	if (s == 0) {
@@ -417,7 +496,7 @@ int main(void)
 				log_msg("[BOOT] Committed -> active bank\r\n");
 			} else if (s->ota_state == OTA_STATE_UNCOMMITTED) {
 				log_msg("[BOOT] App requested rollback\r\n");
-				if (!settings_rollback(s, OTA_STATE_COMMITTED)) {
+				if (!settings_rollback(&s_copy, OTA_STATE_COMMITTED)) {
 					log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 				}
 				target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
@@ -425,23 +504,27 @@ int main(void)
 				uint8_t r = s->ota_boot_retries;
 				if (r >= OTA_BOOT_RETRY_MAX) {
 					log_msg("[BOOT] Max retries -> rollback to previous bank\r\n");
-					if (!settings_rollback(s, OTA_STATE_AUTO_ROLLED_BACK)) {
+					if (!settings_rollback(&s_copy, OTA_STATE_AUTO_ROLLED_BACK)) {
 						log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 					}
 					target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 				} else {
-					if (!settings_write_retries(s, r + 1)) {
+					/* Если запись счётчика пройдёт успешно, копия s_copy будет
+					 * обновлена (pending остаётся 1, retries = r + 1). */
+					uint8_t cand_bank = s->ota_active_bank;
+					uint8_t prev_bank = s->ota_prev_active_bank;
+					if (!settings_write_retries(&s_copy, r + 1)) {
 						/* Не смогли зафиксировать попытку — тест кандидата
 						 * небезопасен (упадём в цикл без счётчика).
 						 * Возвращаемся на банк, откуда пришли. */
 						log_msg("[BOOT] WARN: retries write FAILED\r\n");
-						target_addr = (s->ota_prev_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
+						target_addr = (prev_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
 					} else {
 						/* Кандидат — банк из ota_active_bank (его выставил
 						 * mg_ota_set_pending_bank: противоположный тому,
 						 * откуда выполнялась прошивка). */
-						target_addr = (s->ota_active_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
-						log_msg(s->ota_active_bank == 1 ?
+						target_addr = (cand_bank == 1) ? BANK_B_ADDR : BANK_A_ADDR;
+						log_msg(cand_bank == 1 ?
 								"[BOOT] Testing BANK B\r\n" : "[BOOT] Testing BANK A\r\n");
 					}
 				}
@@ -461,7 +544,7 @@ int main(void)
 			/* Клеймо "авто-откат кандидата" здесь неуместно: сюда же попадают
 			 * случаи повреждения УЖЕ committed-банка (state==3) и неудачного
 			 * ручного отката (state==2). Оставляем прежнее поведение. */
-			if (!settings_rollback(s, OTA_STATE_COMMITTED)) {
+			if (!settings_rollback(&s_copy, OTA_STATE_COMMITTED)) {
 				log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 			}
 		}
