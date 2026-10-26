@@ -65,6 +65,10 @@ typedef struct __attribute__((packed)) {
     uint8_t ota_prev_active_bank;    // банк, активный ДО текущего OTA-цикла
     char    ota_bank_a_version[16];  // последняя подтверждённая версия в Bank A
     char    ota_bank_b_version[16];  // последняя подтверждённая версия в Bank B
+    uint32_t ota_bank_a_size;        // размер образа Bank A (0 = записи нет, прошито напрямую)
+    uint32_t ota_bank_a_crc;         // CRC32 образа Bank A
+    uint32_t ota_bank_b_size;        // размер образа Bank B (0 = записи нет)
+    uint32_t ota_bank_b_crc;         // CRC32 образа Bank B
 } HTTPSsettings;
 /* USER CODE END PTD */
 
@@ -125,6 +129,77 @@ static bool write_settings(const HTTPSsettings *data);
 static bool settings_area_is_erased(void);
 static bool flash_is_dual_bank(void);
 static bool app_image_valid(uint32_t app_addr);
+#define BANK_CAPACITY 0x000C0000u
+
+typedef enum {
+    IMG_BAD_MSP = 0,
+    IMG_BAD_CRC = 1,
+    IMG_OK      = 2
+} img_status_t;
+
+/* CRC32 zlib (полином 0xEDB88320): тот же алгоритм, что mg_crc32() в приложении. */
+static uint32_t image_crc32(uint32_t addr, uint32_t size)
+{
+    static const uint32_t lut[16] = {
+        0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC,
+        0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+        0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C,
+        0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C };
+    const uint8_t *p = (const uint8_t *)addr;
+    uint32_t crc = 0xFFFFFFFFu;
+    while (size--) {
+        uint8_t b = *p++;
+        crc = lut[(crc ^ b) & 0x0F] ^ (crc >> 4);
+        crc = lut[(crc ^ (b >> 4)) & 0x0F] ^ (crc >> 4);
+    }
+    return ~crc;
+}
+
+static img_status_t bank_image_status(const HTTPSsettings *s, uint32_t addr)
+{
+    if (!app_image_valid(addr)) return IMG_BAD_MSP;
+    if (s == 0) return IMG_OK;
+
+    /* CRC считается только на пробных загрузках OTA-кандидата (pending == 1).
+     * В штатном режиме подтверждённый образ уже работал, а банк, залитый
+     * напрямую через ST-Link, определяет и исправляет само приложение
+     * (mg_ota_sync_bank_records()). Так обычный старт не тратит ~4 с на CRC. */
+    if (s->ota_pending != 1) {
+        log_msg(addr == BANK_B_ADDR ?
+                "[BOOT] Bank B: MSP check only (no OTA trial)\r\n" :
+                "[BOOT] Bank A: MSP check only (no OTA trial)\r\n");
+        return IMG_OK;
+    }
+
+    uint32_t size = (addr == BANK_B_ADDR) ? s->ota_bank_b_size : s->ota_bank_a_size;
+    uint32_t crc  = (addr == BANK_B_ADDR) ? s->ota_bank_b_crc  : s->ota_bank_a_crc;
+
+    /* Записи о CRC нет (прошито напрямую через ST-Link): остаётся проверка MSP. */
+    if (size == 0 || size > BANK_CAPACITY) return IMG_OK;
+
+    uint32_t calc = image_crc32(addr, size);
+    char buf[110];
+    char name = (addr == BANK_B_ADDR) ? 'B' : 'A';
+    if (calc != crc) {
+        snprintf(buf, sizeof(buf),
+                 "[BOOT] Bank %c: CRC MISMATCH size=%lu exp=0x%08lX got=0x%08lX\r\n",
+                 name, (unsigned long)size, (unsigned long)crc, (unsigned long)calc);
+        log_msg(buf);
+        return IMG_BAD_CRC;
+    }
+    snprintf(buf, sizeof(buf), "[BOOT] Bank %c: CRC OK size=%lu\r\n",
+             name, (unsigned long)size);
+    log_msg(buf);
+    return IMG_OK;
+}
+
+/* Банк пригоден к запуску: MSP валиден, а на пробной загрузке OTA-кандидата
+ * (ota_pending == 1) ещё и совпал CRC. Несовпадение CRC при pending == 1 =
+ * повреждённый образ, банк отвергается, как и раньше. */
+static bool bank_bootable(const HTTPSsettings *s, uint32_t addr)
+{
+    return bank_image_status(s, addr) == IMG_OK;
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -451,7 +526,19 @@ int main(void)
 	 * иначе первые строки [BOOT] теряются. */
 	HAL_Delay(100);
 
-	log_msg("\r\n[BOOT] === Bootloader started ===\r\n");
+	{
+		char b[160];
+		snprintf(b, sizeof(b),
+				"\r\n[BOOT] === Bootloader started, build %s %s ===\r\n",
+				__DATE__, __TIME__);
+		log_msg(b);
+		snprintf(b, sizeof(b),
+				"[BOOT] settings: struct=%u slot=%u OPTCR=0x%08lX\r\n",
+				(unsigned)sizeof(HTTPSsettings),
+				(unsigned)SETTINGS_ALIGNED_SIZE,
+				(unsigned long)FLASH->OPTCR);
+		log_msg(b);
+	}
 
 	/* ── Проверка режима flash bank ── */
 	{
@@ -535,23 +622,25 @@ int main(void)
 		}
 	}
 
-	/* Не прыгать в пустой/битый образ. Оба банка проверяются одинаково
-	 * (без привилегии Bank A): при невалидном цели откатываем настройки
-	 * на предыдущий банк и пробуем противоположный. */
-	if (!app_image_valid(target_addr)) {
+	/* Не прыгать в пустой/битый образ: MSP + CRC32 (если запись о CRC есть). */
+	if (!bank_bootable(s, target_addr)) {
 		log_msg("[BOOT] Target bank image INVALID\r\n");
 		if (s != 0 && s->ota_pending == 1) {
-			/* Клеймо "авто-откат кандидата" здесь неуместно: сюда же попадают
-			 * случаи повреждения УЖЕ committed-банка (state==3) и неудачного
-			 * ручного отката (state==2). Оставляем прежнее поведение. */
 			if (!settings_rollback(&s_copy, OTA_STATE_COMMITTED)) {
 				log_msg("[BOOT] WARN: rollback write FAILED\r\n");
 			}
 		}
 		uint32_t fallback = (target_addr == BANK_A_ADDR) ? BANK_B_ADDR : BANK_A_ADDR;
-		if (app_image_valid(fallback)) {
+		if (bank_bootable(s, fallback)) {
 			target_addr = fallback;
 			log_msg("[BOOT] Falling back to the other bank\r\n");
+		} else if (app_image_valid(target_addr)) {
+			/* Ни один банк не прошёл CRC: лучше запустить образ с верным MSP,
+			 * чем остановиться (контроллер в труднодоступном месте). */
+			log_msg("[BOOT] No bank passed CRC, booting target by MSP only\r\n");
+		} else if (app_image_valid(fallback)) {
+			target_addr = fallback;
+			log_msg("[BOOT] No bank passed CRC, booting other bank by MSP only\r\n");
 		} else {
 			log_msg("[BOOT] BOTH banks invalid, halting\r\n");
 			while (1);
